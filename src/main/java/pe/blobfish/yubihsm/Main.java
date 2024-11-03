@@ -8,6 +8,7 @@ import org.bouncycastle.util.Arrays;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -17,10 +18,11 @@ import java.util.List;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
+import static com.yubico.hsm.yhdata.LogEntry.LOG_ENTRY_DIGEST_SIZE;
+import static com.yubico.hsm.yhdata.LogEntry.LOG_ENTRY_SIZE;
+
 public class Main {
-
-    private static final int HALF_LOG_ENTRY_SIZE = LogEntry.LOG_ENTRY_SIZE / 2;
-
+    
     public static void main(String[] args) {
         if (args.length < 1) {
             System.err.println("Usage: java -jar yubihsm-java-verify-audit-logs.jar <directory-path>");
@@ -49,19 +51,18 @@ public class Main {
     }
 
     private static List<LogEntry> verifyLogEntries(byte[] logBytes) throws Exception {
-        int logSize = logBytes.length / LogEntry.LOG_ENTRY_SIZE;
+        int logSize = logBytes.length / LOG_ENTRY_SIZE;
         List<LogEntry> logEntries = new ArrayList<>();
+
         LogEntry previousLogEntry = null;
 
         for (int i = 0; i < logSize; i++) {
-            byte[] currentLogEntryBytes = Arrays.copyOfRange(logBytes, i * LogEntry.LOG_ENTRY_SIZE, (i + 1) * LogEntry.LOG_ENTRY_SIZE);
+            byte[] currentLogEntryBytes = Arrays.copyOfRange(logBytes, i * LOG_ENTRY_SIZE, (i + 1) * LOG_ENTRY_SIZE);
             LogEntry currentLogEntry = new LogEntry(currentLogEntryBytes);
-            byte[] currentLogEntryDataBytes = Arrays.copyOf(currentLogEntryBytes, HALF_LOG_ENTRY_SIZE);
-
             if (i == 0) {
-                verifyFirstLogEntry(currentLogEntry, currentLogEntryDataBytes);
+                verifyFirstLogEntry(currentLogEntry);
             } else {
-                verifyConsecutiveLogEntry(previousLogEntry, currentLogEntry, currentLogEntryDataBytes);
+                verifyConsecutiveLogEntry(currentLogEntry, previousLogEntry);
             }
 
             logEntries.add(currentLogEntry);
@@ -70,28 +71,28 @@ public class Main {
         return logEntries;
     }
 
-    private static void verifyFirstLogEntry(LogEntry currentLogEntry, byte[] currentLogEntryDataBytes) throws Exception {
+    private static void verifyFirstLogEntry(LogEntry currentLogEntry) throws Exception {
         if (currentLogEntry.getItemNumber() != 1) {
             throw new Exception("First log entry doesn't have item number 1");
         }
-        byte[] expectedFirstLogEntryData = new byte[HALF_LOG_ENTRY_SIZE];
+        byte[] expectedFirstLogEntryData = new byte[LOG_ENTRY_SIZE - LOG_ENTRY_DIGEST_SIZE];
         expectedFirstLogEntryData[0] = 0x00;
         expectedFirstLogEntryData[1] = 0x01;
-        for (int j = 2; j < HALF_LOG_ENTRY_SIZE; j++) {
+        for (int j = 2; j < expectedFirstLogEntryData.length; j++) {
             expectedFirstLogEntryData[j] = (byte) 0xff;
         }
-        if (!ByteUtils.equals(currentLogEntryDataBytes, expectedFirstLogEntryData)) {
+        if (!ByteUtils.equals(constructLogEntryData(currentLogEntry), expectedFirstLogEntryData)) {
             throw new Exception("First log entry doesn't match the expected value of 0x00, 0x01, 0xff, 0xff...");
         }
     }
 
-    private static void verifyConsecutiveLogEntry(LogEntry previousLogEntry, LogEntry currentLogEntry, byte[] currentLogEntryDataBytes) throws Exception {
+    private static void verifyConsecutiveLogEntry(LogEntry currentLogEntry, LogEntry previousLogEntry) throws Exception {
         if (previousLogEntry.getItemNumber() != currentLogEntry.getItemNumber() - 1) {
             throw new Exception("Log entries are not consecutive. Expected previous item number " + (currentLogEntry.getItemNumber() - 1) + " but got " + previousLogEntry.getItemNumber());
         }
         byte[] previousLogEntryDigest = previousLogEntry.getEntryDigest();
-        byte[] calculatedDigest = MessageDigest.getInstance("SHA-256").digest(Arrays.concatenate(currentLogEntryDataBytes, previousLogEntryDigest));
-        byte[] calculatedDigestTruncated = Arrays.copyOfRange(calculatedDigest, 0, HALF_LOG_ENTRY_SIZE);
+        byte[] calculatedDigest = MessageDigest.getInstance("SHA-256").digest(Arrays.concatenate(constructLogEntryData(currentLogEntry), previousLogEntryDigest));
+        byte[] calculatedDigestTruncated = Arrays.copyOfRange(calculatedDigest, 0, LOG_ENTRY_DIGEST_SIZE);
         if (!ByteUtils.equals(calculatedDigestTruncated, currentLogEntry.getEntryDigest())) {
             throw new Exception("Digests don't match for entry " + (currentLogEntry.getItemNumber()));
         }
@@ -103,6 +104,19 @@ public class Main {
         for (LogEntry logEntry : logEntries) {
             System.out.println(logEntry.toString().trim());
         }
+    }
+
+    private static byte[] constructLogEntryData(LogEntry logEntry) {
+        ByteBuffer logEntryData = ByteBuffer.allocate(16);
+        logEntryData.putShort(logEntry.getItemNumber());
+        logEntryData.put(logEntry.getCommandId());
+        logEntryData.putShort(logEntry.getCommandLength());
+        logEntryData.putShort(logEntry.getSessionKeyId());
+        logEntryData.putShort(logEntry.getTargetKeyId());
+        logEntryData.putShort(logEntry.getTargetKeyId2());
+        logEntryData.put(logEntry.getCommandErrorCode());
+        logEntryData.putInt(logEntry.getSystick());
+        return logEntryData.array();
     }
 
     private static class LogFileProcessor implements Consumer<Path> {
